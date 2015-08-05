@@ -30,10 +30,14 @@ import (
 	"github.com/rackspace/gophercloud/openstack"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/flavors"
 	"github.com/rackspace/gophercloud/openstack/compute/v2/servers"
+	"github.com/rackspace/gophercloud/openstack/networking/v2/ports"
+	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/layer3/floatingips"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/lbaas/members"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/lbaas/monitors"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/lbaas/pools"
 	"github.com/rackspace/gophercloud/openstack/networking/v2/extensions/lbaas/vips"
+	"github.com/rackspace/gophercloud/openstack/networking/v2/networks"
+	"github.com/rackspace/gophercloud/openstack/networking/v2/subnets"
 	"github.com/rackspace/gophercloud/pagination"
 
 	"github.com/GoogleCloudPlatform/kubernetes/pkg/api"
@@ -75,6 +79,7 @@ type LoadBalancerOpts struct {
 	MonitorDelay      MyDuration `gcfg:"monitor-delay"`
 	MonitorTimeout    MyDuration `gcfg:"monitor-timeout"`
 	MonitorMaxRetries uint       `gcfg:"monitor-max-retries"`
+    FloatingNetworkId string     `gcfg:"floating-network-id"`
 }
 
 // OpenStack is an implementation of cloud provider Interface for OpenStack.
@@ -231,6 +236,7 @@ func (i *Instances) List(name_filter string) ([]string, error) {
 }
 
 func getServerByName(client *gophercloud.ServiceClient, name string) (*servers.Server, error) {
+    glog.V(4).Infof("openstack getServerByName(%v, %v) called", client, name)
 	opts := servers.ListOpts{
 		Name:   fmt.Sprintf("^%s$", regexp.QuoteMeta(name)),
 		Status: "ACTIVE",
@@ -263,54 +269,164 @@ func getServerByName(client *gophercloud.ServiceClient, name string) (*servers.S
 	return &serverList[0], nil
 }
 
-func findAddrs(netblob interface{}) []string {
+func getSubnetById(c *gophercloud.ServiceClient, subnetId string) (*subnets.Subnet, error) {
+    glog.V(4).Infof("getSubnetById(%v, %v) called", c, subnetId)
+    opts := subnets.ListOpts{
+        ID: subnetId,
+    }
+    pager := subnets.List(c, opts)
+	subnetList := make([]subnets.Subnet, 0, 1)
+
+	err := pager.EachPage(func(page pagination.Page) (bool, error) {
+		sn, err := subnets.ExtractSubnets(page)
+		if err != nil {
+			return false, err
+		}
+		subnetList = append(subnetList, sn...)
+		if len(subnetList) > 1 {
+			return false, ErrMultipleResults
+		}
+		return true, nil
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if len(subnetList) == 0 {
+		return nil, ErrNotFound
+	} else if len(subnetList) > 1 {
+		return nil, ErrMultipleResults
+	}
+
+	return &subnetList[0], nil
+}
+
+func getNetworkById(c *gophercloud.ServiceClient, networkId string) (*networks.Network, error) {
+    glog.V(4).Infof("getNetworkById(%v, %v) called", c, networkId)
+    opts := networks.ListOpts{ID: networkId}
+    pager := networks.List(c, opts)
+	networkList := make([]networks.Network, 0, 1)
+
+	err := pager.EachPage(func(page pagination.Page) (bool, error) {
+		n, err := networks.ExtractNetworks(page)
+		if err != nil {
+			return false, err
+		}
+		networkList = append(networkList, n...)
+		if len(networkList) > 1 {
+			return false, ErrMultipleResults
+		}
+		return true, nil
+	})
+	if err != nil {
+		if isNotFound(err) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+
+	if len(networkList) == 0 {
+		return nil, ErrNotFound
+	} else if len(networkList) > 1 {
+		return nil, ErrMultipleResults
+	}
+
+	return &networkList[0], nil
+}
+
+func getNetworkNameBySubnetId(c *gophercloud.ServiceClient, subnetId string) (string, error) {
+    glog.V(4).Infof("getNetworkNameBySubnetId(%v, %v) called", c, subnetId)
+    subnet, err := getSubnetById(c, subnetId)
+    if err != nil {
+        return "", err
+    }
+    network, err := getNetworkById(c, subnet.NetworkID)
+    if err != nil {
+        return "", err
+    }
+    return network.Name, nil
+}
+
+func findAddrs(netblob interface{}) []api.NodeAddress {
+    addrs := []api.NodeAddress{}
 	// Run-time types for the win :(
-	ret := []string{}
 	list, ok := netblob.([]interface{})
 	if !ok {
-		return ret
+		return addrs
 	}
 	for _, item := range list {
 		props, ok := item.(map[string]interface{})
 		if !ok {
 			continue
 		}
-		tmp, ok := props["addr"]
+
+        tmpIP, ok := props["addr"]
 		if !ok {
 			continue
 		}
-		addr, ok := tmp.(string)
+
+        tmpType, ok := props["OS-EXT-IPS:type"]
 		if !ok {
 			continue
 		}
-		ret = append(ret, addr)
+
+        tmpAddr := api.NodeAddress{}
+        addrIP, ok := tmpIP.(string)
+		if !ok {
+			continue
+		}
+        tmpAddr.Address = addrIP
+        addrType, ok := tmpType.(string)
+		if !ok {
+			continue
+		}
+        if addrType == "fixed" {
+            tmpAddr.Type = api.NodeInternalIP
+        } else if addrType == "floating" {
+            tmpAddr.Type = api.NodeExternalIP
+        } else {
+            continue
+        }
+        api.AddToNodeAddresses(&addrs, tmpAddr)
 	}
-	return ret
+	return addrs
 }
 
-func getAddressByName(api *gophercloud.ServiceClient, name string) (string, error) {
-	srv, err := getServerByName(api, name)
+func getAddressByNameAndSubnetId(c *gophercloud.ServiceClient, n *gophercloud.ServiceClient, name string, subnetId string) (string, error) {
+    glog.V(4).Infof("getAddressByNameAndSubnetId(%v, %v, %v) called", c, name, subnetId)
+	srv, err := getServerByName(c, name)
 	if err != nil {
 		return "", err
 	}
-
+    netName, err := getNetworkNameBySubnetId(n, subnetId)
+    if err != nil {
+        return "", err
+    }
 	var s string
-	if s == "" {
-		if tmp := findAddrs(srv.Addresses["private"]); len(tmp) >= 1 {
-			s = tmp[0]
-		}
-	}
-	if s == "" {
-		if tmp := findAddrs(srv.Addresses["public"]); len(tmp) >= 1 {
-			s = tmp[0]
-		}
-	}
-	if s == "" {
-		s = srv.AccessIPv4
-	}
-	if s == "" {
-		s = srv.AccessIPv6
-	}
+    addrs := findAddrs(srv.Addresses[netName])
+    if len(addrs) == 0 {
+        return "", ErrNoAddressFound
+    }
+    pubAddrs := []string{}
+    privAddrs := []string{}
+
+    for _, addr := range addrs {
+        if addr.Type == api.NodeInternalIP {
+            privAddrs = append(privAddrs, addr.Address)
+        } else if addr.Type == api.NodeExternalIP {
+            pubAddrs = append(pubAddrs, addr.Address)
+        }
+    }
+
+    if len(privAddrs) >= 1 {
+        s = privAddrs[0]
+    } else if len(pubAddrs) >= 1 {
+        s = pubAddrs[0]
+    }
+
 	if s == "" {
 		return "", ErrNoAddressFound
 	}
@@ -336,19 +452,12 @@ func (i *Instances) NodeAddresses(name string) ([]api.NodeAddress, error) {
 
 	addrs := []api.NodeAddress{}
 
-	for _, addr := range findAddrs(srv.Addresses["private"]) {
-		addrs = append(addrs, api.NodeAddress{
-			Type:    api.NodeInternalIP,
-			Address: addr,
-		})
-	}
-
-	for _, addr := range findAddrs(srv.Addresses["public"]) {
-		addrs = append(addrs, api.NodeAddress{
-			Type:    api.NodeExternalIP,
-			Address: addr,
-		})
-	}
+    for _, net := range srv.Addresses {
+        tmpAddrs := findAddrs(net)
+        if len(tmpAddrs) >= 1 {
+            api.AddToNodeAddresses(&addrs, tmpAddrs...)
+        }
+    }
 
 	// AccessIPs are usually duplicates of "public" addresses.
 	api.AddToNodeAddresses(&addrs,
@@ -579,14 +688,14 @@ func (lb *LoadBalancer) CreateTCPLoadBalancer(name, region string, externalIP ne
 	}
 
 	for _, host := range hosts {
-		addr, err := getAddressByName(lb.compute, host)
+		addr, err := getAddressByNameAndSubnetId(lb.compute, lb.network, host, lb.opts.SubnetId)
 		if err != nil {
 			return nil, err
 		}
 
 		_, err = members.Create(lb.network, members.CreateOpts{
 			PoolID:       pool.ID,
-			ProtocolPort: ports[0].Port, //TODO: need to handle multi-port
+			ProtocolPort: ports[0].NodePort, //TODO: need to handle multi-port
 			Address:      addr,
 		}).Extract()
 		if err != nil {
@@ -622,10 +731,13 @@ func (lb *LoadBalancer) CreateTCPLoadBalancer(name, region string, externalIP ne
 		Protocol:     "TCP",
 		ProtocolPort: ports[0].Port, //TODO: need to handle multi-port
 		PoolID:       pool.ID,
+        SubnetID:     lb.opts.SubnetId,
 		Persistence:  persistence,
 	}
-	if !externalIP.IsUnspecified() {
+    glog.V(4).Infof("externalIP: %v", externalIP)
+	if externalIP != nil {
 		createOpts.Address = externalIP.String()
+        glog.V(4).Infof("createOpts.Address: %v", createOpts.Address)
 	}
 
 	vip, err := vips.Create(lb.network, createOpts).Extract()
@@ -638,9 +750,74 @@ func (lb *LoadBalancer) CreateTCPLoadBalancer(name, region string, externalIP ne
 	}
 
 	status := &api.LoadBalancerStatus{}
+
+
 	status.Ingress = []api.LoadBalancerIngress{{IP: vip.Address}}
 
+
+    if lb.opts.FloatingNetworkId == "" {
+        return status, nil
+    }
+
+    // Get port for VIP/LB
+    vipPort, err := getVipPort(lb.network, vip)
+    if err != nil {
+        glog.V(4).Infof("Failed to get VIP Port: %v", err)
+        return status, nil
+    }
+
+    glog.V(4).Infof("Got VIP Port: %v", vipPort.ID)
+    fip, err := createFloatingIP(lb.network, lb.opts.FloatingNetworkId, vipPort.ID)
+    if err != nil {
+        glog.V(4).Infof("Failed to create floating IP: %v", err)
+        return status, nil
+    }
+    glog.V(4).Infof("Successfully associated floating IP: %v", fip.FloatingIP)
+    status.Ingress = append(status.Ingress, api.LoadBalancerIngress{IP: fip.FloatingIP})
+
 	return status, nil
+}
+
+func getVipPort(c *gophercloud.ServiceClient, v *vips.VirtualIP) (*ports.Port, error) {
+    glog.V(4).Infof("getVipPort(%v, %v) called", c, v)
+    portName := fmt.Sprintf("vip-%s", v.ID)
+    pager := ports.List(c, ports.ListOpts{Name: portName})
+    portList := make([]ports.Port, 0, 1)
+    err := pager.EachPage(func(page pagination.Page) (bool, error) {
+        p, err := ports.ExtractPorts(page)
+        if err != nil {
+            return false, err
+        }
+        portList = append(portList, p...)
+        // TODO: Check the result for the correct IP/Subnet too
+        if len(portList) > 1 {
+            return false, ErrMultipleResults
+        }
+        return true, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    if len(portList) == 0 {
+        return nil, ErrNotFound
+    } else if len(portList) > 1 {
+        return nil, ErrMultipleResults
+    }
+
+    return &portList[0], nil
+}
+
+func createFloatingIP(c *gophercloud.ServiceClient, floatingNetId string, portId string) (*floatingips.FloatingIP, error) {
+    glog.V(4).Infof("createFloatingIP(%v, %v, %v) called", c, floatingNetId, portId)
+    opts := floatingips.CreateOpts{
+        FloatingNetworkID: floatingNetId,
+        PortID: portId,
+    }
+    fip, err := floatingips.Create(c, opts).Extract()
+    if err != nil {
+        return nil, err
+    }
+    return fip, nil
 }
 
 func (lb *LoadBalancer) UpdateTCPLoadBalancer(name, region string, hosts []string) error {
@@ -654,7 +831,7 @@ func (lb *LoadBalancer) UpdateTCPLoadBalancer(name, region string, hosts []strin
 	// Set of member (addresses) that _should_ exist
 	addrs := map[string]bool{}
 	for _, host := range hosts {
-		addr, err := getAddressByName(lb.compute, host)
+		addr, err := getAddressByNameAndSubnetId(lb.compute, lb.network, host, lb.opts.SubnetId)
 		if err != nil {
 			return err
 		}
@@ -704,6 +881,49 @@ func (lb *LoadBalancer) UpdateTCPLoadBalancer(name, region string, hosts []strin
 	return nil
 }
 
+func getFloatingIP(c *gophercloud.ServiceClient, port *ports.Port) (*floatingips.FloatingIP, error) {
+    glog.V(4).Infof("getFloatingIP(%v, %v) called", c, port)
+    pager := floatingips.List(c, floatingips.ListOpts{PortID: port.ID})
+    fipList := make([]floatingips.FloatingIP, 0, 1)
+    err := pager.EachPage(func(page pagination.Page) (bool, error) {
+        f, err := floatingips.ExtractFloatingIPs(page)
+        if err != nil {
+            return false, err
+        }
+        fipList = append(fipList, f...)
+        if len(fipList) > 1 {
+            return false, ErrMultipleResults
+        }
+        return true, nil
+    })
+    if err != nil {
+        return nil, err
+    }
+    if len(fipList) == 0 {
+        return nil, ErrNotFound
+    } else if len(fipList) > 1 {
+        return nil, ErrMultipleResults
+    }
+
+    return &fipList[0], nil
+}
+
+func deleteFloatingIP(c *gophercloud.ServiceClient, vip *vips.VirtualIP) error {
+    glog.V(4).Infof("deleteFloatingIP(%v, %v) called", c, vip)
+    port, err := getVipPort(c, vip)
+    if err != nil {
+        return err
+    }
+    floatingIP, err := getFloatingIP(c, port)
+    if err != nil {
+        return err
+    }
+    if err := floatingips.Delete(c, floatingIP.ID).ExtractErr(); err != nil {
+        return err
+    }
+    return nil
+}
+
 func (lb *LoadBalancer) EnsureTCPLoadBalancerDeleted(name, region string) error {
 	glog.V(4).Infof("EnsureTCPLoadBalancerDeleted(%v, %v)", name, region)
 
@@ -711,6 +931,10 @@ func (lb *LoadBalancer) EnsureTCPLoadBalancerDeleted(name, region string) error 
 	if err != nil && err != ErrNotFound {
 		return err
 	}
+
+    if err := deleteFloatingIP(lb.network, vip); err != nil {
+        glog.V(4).Infof("Failed to delete Floating IP: %v", err)
+    }
 
 	// We have to delete the VIP before the pool can be deleted,
 	// so no point continuing if this fails.
